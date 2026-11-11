@@ -37,6 +37,7 @@
   button.export { background: var(--green); color: #fff; padding: 5px 12px; font-size: 13px; }
   input[type=file] { color: var(--muted); }
   .file-name { color: var(--muted); }
+  .status-text { color: var(--accent); font-size: 13px; }
   details { margin-top: 12px; color: var(--muted); }
   details summary { cursor: pointer; color: var(--accent); }
   details code, .mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12.5px; }
@@ -93,6 +94,7 @@
       <button class="secondary" id="sampleBtn">📦 载入内置夏令时样例</button>
       <button id="solveBtn" disabled>开始清洗</button>
       <span class="file-name" id="fileName">未选择文件</span>
+      <span class="status-text" id="statusText"></span>
       <span class="spacer"></span>
       <button class="export" id="exportAllBtn" disabled>⬇ 导出全部可导出机尾</button>
     </div>
@@ -122,8 +124,18 @@
 <footer>仅整链唯一解的机尾允许入仓 · 重复时刻双候选求解 · 不存在时刻硬性报错</footer>
 
 <script>
+// ---------------------------------------------------------------------------
+// 状态约定
+//   currentFile : 当前所选文件（可能尚未清洗）
+//   previewFile : 生成当前预览的那份 CSV。两种下载都只发送它，
+//                 保证「核对过的预览」与「下载入仓的内容」来自同一份数据
+//   epoch       : 代际计数。换文件、点载入样例、开始清洗都会 +1；
+//                 异步响应只在仍是当前代际时才允许改动界面，
+//                 晚到的旧响应（无论成功或失败）一律整体丢弃
+// ---------------------------------------------------------------------------
 let currentFile = null;
-let lastResult = null;
+let previewFile = null;
+let epoch = 0;
 
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s).replace(/[&<>"']/g,
@@ -136,40 +148,80 @@ const STATUS_META = {
   error:       {label: '数据错误 · 禁止导出', cls: 'error'},
 };
 
-$('fileInput').addEventListener('change', (e) => {
-  currentFile = e.target.files[0] || null;
-  $('fileName').textContent = currentFile ? currentFile.name : '未选择文件';
-  $('solveBtn').disabled = !currentFile;
-});
+function setStatus(msg) { $('statusText').textContent = msg; }
+function refreshSolveBtn() { $('solveBtn').disabled = !currentFile; }
 
-$('sampleBtn').addEventListener('click', async () => {
-  const resp = await fetch('/api/sample');
-  const blob = await resp.blob();
-  currentFile = new File([blob], 'dst_sample.csv', {type: 'text/csv'});
-  $('fileName').textContent = '已载入内置样例 dst_sample.csv';
-  $('solveBtn').disabled = false;
-  $('fileInput').value = '';
-});
-
-$('solveBtn').addEventListener('click', async () => {
-  hideGlobalError();
+// 立即撤下旧预览：清空结果区与汇总、隐藏错误、停用批量下载
+// （按机尾的导出按钮渲染在结果区内，随预览一起被移除）
+function invalidatePreview() {
+  previewFile = null;
   $('results').innerHTML = '';
   $('summary').innerHTML = '';
   $('exportAllBtn').disabled = true;
-  const fd = new FormData();
-  fd.append('file', currentFile);
-  $('solveBtn').disabled = true;
+  hideGlobalError();
+  setStatus('');
+}
+
+$('fileInput').addEventListener('change', (e) => {
+  const file = e.target.files[0] || null;
+  e.target.value = '';   // 重置 input：再次选择同名（更正版）文件也会触发 change
+  epoch++;               // 使进行中的样例载入 / 清洗响应失效
+  currentFile = file;
+  invalidatePreview();
+  $('fileName').textContent = file ? file.name : '未选择文件';
+  refreshSolveBtn();
+});
+
+$('sampleBtn').addEventListener('click', async () => {
+  const myEpoch = ++epoch;
+  currentFile = null;
+  invalidatePreview();
+  $('fileName').textContent = '未选择文件';
+  refreshSolveBtn();
+  setStatus('样例载入中…（可随时另选文件）');
+  let resp;
   try {
-    const resp = await fetch('/api/solve', {method: 'POST', body: fd});
-    const data = await resp.json();
-    if (!resp.ok) { showGlobalError(data.detail || '求解失败'); return; }
-    lastResult = data;
-    render(data);
+    resp = await fetch('/api/sample');
   } catch (err) {
-    showGlobalError('请求失败: ' + err);
-  } finally {
-    $('solveBtn').disabled = false;
+    if (myEpoch === epoch) { setStatus(''); showGlobalError('样例载入失败: ' + err); }
+    return;  // 晚到的旧响应：不改任何状态
   }
+  if (myEpoch !== epoch) return;
+  if (!resp.ok) { setStatus(''); showGlobalError('样例载入失败: HTTP ' + resp.status); return; }
+  const blob = await resp.blob();
+  if (myEpoch !== epoch) return;   // 读取内容期间用户已另选文件
+  currentFile = new File([blob], 'dst_sample.csv', {type: 'text/csv'});
+  setStatus('');
+  $('fileName').textContent = '已载入内置样例 dst_sample.csv';
+  refreshSolveBtn();
+});
+
+$('solveBtn').addEventListener('click', async () => {
+  const file = currentFile;
+  if (!file) return;
+  const myEpoch = ++epoch;   // 新一轮清洗：此前的清洗 / 样例响应全部作废
+  invalidatePreview();
+  setStatus('清洗中：' + file.name + ' …（可另选文件重新开始）');
+  // 清洗期间不锁定界面：此时仍可另选文件并再次点击「开始清洗」，
+  // 新的 epoch 会让本次响应自动失效
+  const fd = new FormData();
+  fd.append('file', file);
+  let resp, data = null;
+  try {
+    resp = await fetch('/api/solve', {method: 'POST', body: fd});
+    data = await resp.json().catch(() => null);
+  } catch (err) {
+    if (myEpoch === epoch) { setStatus(''); showGlobalError('请求失败: ' + err); }
+    return;  // 晚到的旧响应：不改任何状态
+  }
+  if (myEpoch !== epoch) return;   // 晚到的旧响应：不改任何状态
+  setStatus('');
+  if (!resp.ok) {
+    showGlobalError((data && data.detail) || '求解失败');
+    return;
+  }
+  previewFile = file;   // 预览与下载绑定同一份 CSV
+  render(data);
 });
 
 $('exportAllBtn').addEventListener('click', () => doExport('__all__'));
@@ -294,11 +346,18 @@ function renderError(t) {
 }
 
 async function doExport(tail) {
-  if (!currentFile) return;
+  const file = previewFile;   // 只用生成当前预览的那份 CSV，绝不用新选未清洗的文件
+  if (!file) return;
   const fd = new FormData();
-  fd.append('file', currentFile);
+  fd.append('file', file);
   fd.append('tail', tail);
-  const resp = await fetch('/api/export', {method: 'POST', body: fd});
+  let resp;
+  try {
+    resp = await fetch('/api/export', {method: 'POST', body: fd});
+  } catch (err) {
+    alert('⚠ 导出请求失败: ' + err);
+    return;
+  }
   if (!resp.ok) {
     let msg = '导出被拒绝';
     try { msg = (await resp.json()).detail || msg; } catch (e) {}
